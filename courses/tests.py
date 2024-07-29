@@ -15,4 +15,4 @@ class EnrollmentModelTest(TestCase):
         course = Course.objects.create(title="Тестовый курс", description="Просто тестовый курс", start_date="2023-01-01", end_date="2023-12-31")
         enrollment = Enrollment.objects.create(user=user, course=course)
         self.assertEqual(enrollment.user.username, "testuser")
-        self.assertEqual(enrollment.course.title, "Тестовый курс")
+        self.assertEqual(enrollment.course.title, "Тестовый курс"exit
