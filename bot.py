@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import aiohttp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 # Настройка окружения Django для работы с базой данных
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'edtech_project.settings')
@@ -25,7 +26,7 @@ from django.contrib.auth.models import User
 
 load_dotenv()
 API_TOKEN = os.getenv('API_TOKEN')
-WEATHER_API_KEY = os.getenv('WEATHER_API_KEY')  # Добавьте ваш ключ API для погоды
+WEATHER_API_KEY = os.getenv('WEATHER_API_KEY')
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +41,7 @@ class Form(StatesGroup):
     name = State()
     age = State()
     city = State()
+    waiting_for_answer = State()
 
 # Обработчик команды /start и /help
 @router.message(CommandStart())
@@ -55,7 +57,8 @@ async def send_welcome(message: Message):
         "<b>/inline</b> - Показать inline кнопки\n"
         "<b>/setname</b> - Установить имя и возраст\n"
         "<b>/users</b> - Показать пользователей\n"
-        "<b>/weather</b> - Получить погоду"
+        "<b>/weather</b> - Получить погоду\n"
+        "<b>/ask</b> - Спросить, как дела"
     )
     await message.reply(welcome_text, parse_mode=ParseMode.HTML)
 
@@ -70,7 +73,8 @@ async def send_help(message: Message):
         "<b>/inline</b> - Показать inline кнопки\n"
         "<b>/setname</b> - Установить имя и возраст\n"
         "<b>/users</b> - Показать пользователей\n"
-        "<b>/weather</b> - Получить погоду"
+        "<b>/weather</b> - Получить погоду\n"
+        "<b>/ask</b> - Спросить, как дела"
     )
     await message.reply(help_text, parse_mode=ParseMode.HTML)
 
@@ -88,10 +92,14 @@ async def register(message: Message):
         user_profile = await sync_to_async(UserProfile.objects.create)(user=user, telegram_id=user_id)
         await message.reply("Вы <b>успешно зарегистрированы</b>! 🎉", parse_mode=ParseMode.HTML)
     else:
-        # Обновляем telegram_id, если пользователь уже существует
-        user_profile, _ = await sync_to_async(UserProfile.objects.get_or_create)(user=user)
-        user_profile.telegram_id = user_id
-        await sync_to_async(user_profile.save)()
+        # Проверяем существование профиля пользователя и обновляем telegram_id
+        try:
+            user_profile = await sync_to_async(UserProfile.objects.get)(user=user)
+            if user_profile.telegram_id != user_id:
+                user_profile.telegram_id = user_id
+                await sync_to_async(user_profile.save)()
+        except UserProfile.DoesNotExist:
+            user_profile = await sync_to_async(UserProfile.objects.create)(user=user, telegram_id=user_id)
         await message.reply(
             "Вы <b>уже зарегистрированы</b>! 🎉 Вы можете использовать команды:\n"
             "<a href='/courses'>/courses</a> - Для просмотра курсов\n"
@@ -112,7 +120,11 @@ async def list_courses(message: Message):
 # Обработчик команды /echo
 @router.message(Command(commands=["echo"]))
 async def echo(message: Message):
-    await message.reply(f"<b>Эхо:</b> {message.text}", parse_mode=ParseMode.HTML)
+    text_to_echo = message.text[len("/echo "):].strip()
+    if text_to_echo:
+        await message.reply(text_to_echo)
+    else:
+        await message.reply("Пожалуйста, введите текст после команды /echo.")
 
 # Обработчик команды /inline
 @router.message(Command(commands=["inline"]))
@@ -135,6 +147,13 @@ async def process_callback(callback_query: types.CallbackQuery):
 # FSM: Обработчик команды /setname
 @router.message(Command(commands=["setname"]))
 async def set_name(message: Message, state: FSMContext):
+    try:
+        user_profile = await sync_to_async(UserProfile.objects.get)(user__username=message.from_user.username)
+    except UserProfile.DoesNotExist:
+        await message.reply("Вы не зарегистрированы. Пожалуйста, используйте команду /register для регистрации.",
+                            parse_mode=ParseMode.HTML)
+        return
+
     await message.reply("Как вас зовут?", parse_mode=ParseMode.HTML)
     await state.set_state(Form.name)
 
@@ -154,14 +173,14 @@ async def process_age(message: Message, state: FSMContext):
         return
     await state.update_data(age=int(message.text))
     user_data = await state.get_data()
-    # Сохранение данных в профиле пользователя
     user, created = await sync_to_async(User.objects.get_or_create)(username=message.from_user.username)
     user_profile, _ = await sync_to_async(UserProfile.objects.get_or_create)(user=user)
     user.first_name = user_data['name']
     user_profile.age = user_data['age']
     await sync_to_async(user.save)()
     await sync_to_async(user_profile.save)()
-    await message.reply(f"Вас зовут <b>{user_data['name']}</b> и вам <b>{user_data['age']}</b> лет.", parse_mode=ParseMode.HTML)
+    await message.reply(f"Вас зовут <b>{user_data['name']}</b> и вам <b>{user_data['age']}</b> лет.",
+                        parse_mode=ParseMode.HTML)
     await state.clear()
 
 # Обработчик загрузки изображений
@@ -179,7 +198,7 @@ async def list_users(message: Message):
     for user in users:
         try:
             user_profile = await sync_to_async(UserProfile.objects.get)(user=user)
-            response += f"Username: <b>{user.username}</b>, Name: <b>{user.first_name}</b>, Age: <b>{user_profile.age}</b>, Telegram ID: <b>{user_profile.telegram_id}</b>\n"
+            response += f"Username: <b>{user.username}</b>\nName: <b>{user.first_name}</b>\nAge: <b>{user_profile.age}</b>\n"
         except UserProfile.DoesNotExist:
             response += f"Username: <b>{user.username}</b>, Name: <b>{user.first_name}</b>, Age: <b>Не указан</b>\n"
     await message.reply(response, parse_mode=ParseMode.HTML)
@@ -194,12 +213,15 @@ async def weather(message: Message, state: FSMContext):
 async def get_weather(message: Message, state: FSMContext):
     city = message.text
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric") as resp:
+        async with session.get(
+                f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric") as resp:
             data = await resp.json()
             if resp.status == 200:
                 weather_description = data['weather'][0]['description']
                 temperature = data['main']['temp']
-                await message.reply(f"Погода в <b>{city}</b>: {weather_description}, температура: <b>{temperature}°C</b>", parse_mode=ParseMode.HTML)
+                await message.reply(
+                    f"Погода в <b>{city}</b>: {weather_description}, температура: <b>{temperature}°C</b>",
+                    parse_mode=ParseMode.HTML)
             else:
                 await message.reply("Город не найден, попробуйте еще раз.", parse_mode=ParseMode.HTML)
     await state.clear()
@@ -213,20 +235,53 @@ async def handle_errors(update, error):
         return True
     return False
 
-# Уведомления каждую минуту
+# Уведомления каждый день в 12:00 по московскому времени
 async def send_notifications():
     users = await sync_to_async(list)(UserProfile.objects.all())
     for user_profile in users:
         if user_profile.telegram_id:
             try:
-                await bot.send_message(user_profile.telegram_id, "Не забудьте проверить уведомления! 🔔", parse_mode=ParseMode.HTML)
+                await bot.send_message(user_profile.telegram_id, "Не забудьте проверить уведомления, Дарья в 12:00! 🔔",
+                                       parse_mode=ParseMode.HTML)
             except Exception as e:
                 logging.error(f"Error sending notification to {user_profile.user.username}: {e}")
 
 async def scheduler_start():
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_notifications, CronTrigger(minute='*/1'))
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    scheduler.add_job(send_notifications, CronTrigger(hour=12, minute=0, timezone=moscow_tz))
     scheduler.start()
+
+# Новый функционал: Напоминание о необходимости ответа через 15 минут
+@router.message(Command(commands=["ask"]))
+async def ask_user(message: Message, state: FSMContext):
+    user_profile = await sync_to_async(UserProfile.objects.get)(user__username=message.from_user.username)
+    if not user_profile:
+        await message.reply("Вы не зарегистрированы. Пожалуйста, используйте команду /register для регистрации.", parse_mode=ParseMode.HTML)
+        return
+
+    user_first_name = await sync_to_async(lambda: user_profile.user.first_name)()
+    await message.reply(f"Привет, {user_first_name}! Как ты сегодня?", parse_mode=ParseMode.HTML)
+    await state.set_state(Form.waiting_for_answer)
+    await state.update_data(answer_received=False, timer_active=True)
+
+    # Запускаем таймер на 15 минут
+    asyncio.create_task(remind_to_answer(message.chat.id, state))
+
+async def remind_to_answer(chat_id: int, state: FSMContext):
+    await asyncio.sleep(900)
+    user_data = await state.get_data()
+    if user_data.get("timer_active") and not user_data.get("answer_received"):
+        await bot.send_message(chat_id, "Вы забыли ответить.")
+        await state.update_data(timer_active=False)
+
+@router.message(Form.waiting_for_answer)
+async def process_user_answer(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    if user_data.get("timer_active"):
+        await state.update_data(answer_received=True, timer_active=False)
+        await message.reply("Спасибо за ответ!", parse_mode=ParseMode.HTML)
+        await state.clear()
 
 async def main():
     dp.include_router(router)
